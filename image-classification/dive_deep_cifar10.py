@@ -9,8 +9,8 @@ from gluoncv.utils import makedirs, TrainingHistory
 from gluoncv.data import transforms as gcv_transforms
 
 ctx = mx.gpu()
-net = get_model('cifar_resnet20_v1', classes=10, ctx=ctx)
-net.initialize(init=mx.init.Xavier())
+net = get_model('cifar_resnet20_v1', classes=10)
+net.initialize(init=mx.init.Xavier(), ctx=ctx)
 
 # data augment
 transforms_train = transforms.Compose([
@@ -24,14 +24,18 @@ transforms_test = transforms.Compose([
     transforms.Normalize([0.4914, 0.4822, 0.4465], [0.2023, 0.1994, 0.2010])])
 
 # data loader
-batch_size = 256
+per_device_batch_size = 64
+num_workers = 4
+batch_size = per_device_batch_size * num_workers
 train_loader = gluon.data.DataLoader(gluon.data.vision.CIFAR10(train=True).transform_first(transforms_train),
                                      batch_size,
                                      shuffle=True,
-                                     last_batch='discard')
+                                     last_batch='discard',
+                                     num_workers=num_workers)
 test_loader = gluon.data.DataLoader(gluon.data.vision.CIFAR10(train=False).transform_first(transforms_test),
                                     batch_size,
-                                    shuffle=False)
+                                    shuffle=False,
+                                    num_workers=num_workers)
 
 # optimizer , loss, metric (metric 是什么， 作用是什么)
 lr_decay = 0.1
@@ -48,9 +52,9 @@ def test(ctx, val_data):
     metric = mx.metric.Accuracy()
     for i, batch in enumerate(val_data):
         data = batch[0].as_in_context(ctx)
-        label = batch[1].as_in_context(ctx)
+        labels = batch[1].as_in_context(ctx)
         preds = net(data)
-        metric.update(label, preds)
+        metric.update(labels, preds)
     return metric.get()
 
 # training
@@ -81,8 +85,8 @@ for epoch in range(num_epoches):
 
     train_history.update([1 - train_acc, 1 - val_acc])
 
-    print('[epoch %d] train acc=%f  val acc=%f  loss=%f  time:%f' %
-          (epoch+1, train_acc, val_acc, lo / n, time.time() - start))
+    print('[epoch %d lr %.4f] train acc=%f  loss=%f | val acc=%f | time:%.2f sec' %
+          (epoch + 1, trainer.learning_rate, train_acc, train_loss / n, val_acc, time.time() - start))
 
 train_history.plot()
 
