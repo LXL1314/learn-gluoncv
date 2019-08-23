@@ -20,7 +20,7 @@ batch_size = 64
 
 # data augment
 jitter_param = 0.4
-brightness = .1
+brightness = 0.1
 transform_train = transforms.Compose([
     transforms.RandomResizedCrop(224),
     transforms.RandomFlipLeftRight(),
@@ -98,7 +98,6 @@ for epoch in range(epoches):
 
     print('[epoch %d lr %.4f] train acc=%f  loss=%f | val acc=%f | time:%.2f sec' %
           (epoch + 1, trainer.learning_rate, train_acc, train_loss / n, val_acc, time.time() - start))
-
 
 
 
