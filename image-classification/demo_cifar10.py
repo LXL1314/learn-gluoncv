@@ -6,7 +6,7 @@ from gluoncv import utils
 from gluoncv.model_zoo import get_model
 
 url = 'https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/classification/plane-draw.jpeg'
-im_fname = utils.download(url)
+im_fname = utils.download(url, path='../img/plane-draw.jpeg')
 img = image.imread(im_fname)
 plt.imshow(img.asnumpy())
 plt.show()
