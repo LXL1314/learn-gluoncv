@@ -25,6 +25,7 @@ from gluoncv.utils.metrics.coco_detection import COCODetectionMetric
 from mxnet.contrib import amp
 import horovod.mxnet as hvd
 
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train SSD on Pascal VOC dataset")
 
@@ -75,7 +76,7 @@ def parse_args():
                         help='Random seed to be fixed.')
     parser.add_argument('--syncbn', action='store_true',
                         help='Use synchronize BN across devices.')
-    #parser.add_argument('--dali', action='store_true',
+    # parser.add_argument('--dali', action='store_true',
     #                    help='Use DALI for data loading and data preprocessing in training. '
     #                         'Currently supports only COCO.')
     # amp 和 horovod也没搞懂到底用来干什么的
@@ -88,16 +89,19 @@ def parse_args():
     args = parser.parse_args()
     return args
 
+
 def get_dataset(dataset, args):
     # load training and validation images
     if dataset.lower == 'voc':
-        train_dataset = gdata.VOCDetection(root=args.dataset_root + "/voc", splits=[(2007, 'trainval'), (2012, 'trainval')])
+        train_dataset = gdata.VOCDetection(root=args.dataset_root + "/voc",
+                                           splits=[(2007, 'trainval'), (2012, 'trainval')])
         val_dataset = gdata.VOCDetection(root=args.dataset_root + "/voc", splits=[(2007, 'test')])
         val_metric = VOC07MApMetric(iou_thresh=0.5, class_names=val_dataset.classes)
         # if class_names is provided, will print out AP for each class
     elif dataset.lower == 'coco':
         train_dataset = gdata.COCODetection(root=args.dataset_root + "/coco", splits='instances_train2017')
-        val_dataset = gdata.COCODetection(root=args.dataset_root + "/coco", splits='instances_val2017', skip_empty=False)
+        val_dataset = gdata.COCODetection(root=args.dataset_root + "/coco", splits='instances_val2017',
+                                          skip_empty=False)
         val_metric = COCODetectionMetric(val_dataset, args.save_prefix + '_eval', cleanup=True,
                                          data_shape=(args.data_shape, args.data_shape))
         # will print out AP for each class
@@ -108,6 +112,7 @@ def get_dataset(dataset, args):
     else:
         raise NotImplementedError("dataset: {} not implemented".format(dataset))
     return train_dataset, val_dataset, val_metric
+
 
 def get_dataloader(net, train_dataset, val_dataset, data_shape, batch_size, num_workers, ctx):
     """Get dataloader."""
@@ -131,7 +136,7 @@ def get_dataloader(net, train_dataset, val_dataset, data_shape, batch_size, num_
     训练模式时： cls_preds, box_preds, anchors = net(data)
     train_loader中batch的x, y: y本就包含着该图片之前所有生成的锚框target的box位置信息即box_targets（batch_size, N, 4）, N是锚框的个数
             以及每个锚框对应的类别即cls_targets(batch_size, N)
-    
+
     而val_loader是用与验证当前训练的网络，不是处于训练模式，得到的是图片预测objects的ids, scores, bboxes = net(data)
     每个batch的y:(batch_size, n, 6（或者5）): 其中每个图片中n可能不一样， 取决于图片object的数量 
     这里的6： 0-4，是box的位置， 4-5是box对应的类别， 5-6是difficults(还没搞懂这个是什么，作用是啥， 若没有则上面为5, 有则为6)
@@ -146,17 +151,19 @@ def get_dataloader(net, train_dataset, val_dataset, data_shape, batch_size, num_
                                        num_workers=num_workers)
     return train_loader, val_loader
 
+
 def save_params(net, best_map, current_map, epoch, save_interval, prefix):
     current_map = float(current_map)
     if current_map > best_map[0]:
         # 这个if语句，用于记录当前最佳参数至xxx_best.params中， 并记录进日志
         best_map[0] = current_map
         net.save_params('{:s}_best.params'.format(prefix, epoch, current_map))
-        with open(prefix+'_best_map.log', 'a') as f:
+        with open(prefix + '_best_map.log', 'a') as f:
             f.write('{:04d}:\t{:.4f}\n'.format(epoch, current_map))
     if save_interval and epoch % save_interval == 0:
         # 用于在每save_interval个循环间隔， 记录当前的参数至***.params中
         net.save_params('{:s}_{:04d}_{:.4f}.params'.format(prefix, epoch, current_map))
+
 
 def validate(net, val_data, ctx, eval_metric):
     """在验证集上测试当前训练的网络"""
@@ -183,6 +190,7 @@ def validate(net, val_data, ctx, eval_metric):
         # eval_metric， 返回的values(Value of the evaluation)是每一个类的ap值和map,
         # 其中最后一个是mAP值: 也就是所有类的ap值的总和除以类别数
 
+
 def train(net, train_data, val_data, eval_metric, ctx, args):
     net.collect_params.reset_ctx(ctx)
     if args.horovod:
@@ -190,7 +198,8 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
         trainer = hvd.DistributedTrainer(net.collect_params(), 'sgd',
                                          {'learning_rate': args.lr, 'wd': args.wd, 'momentum': args.momentum})
     else:
-        trainer = gluon.Trainer(net.collect_params(), 'sgd', {'learning_rate': args.lr, 'wd': args.wd, 'momentum': args.momentum},
+        trainer = gluon.Trainer(net.collect_params(), 'sgd',
+                                {'learning_rate': args.lr, 'wd': args.wd, 'momentum': args.momentum},
                                 update_on_kvstore=(False if args.amp else None))
 
     if args.amp:
@@ -298,6 +307,7 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
             # 每循环args.val_interval或者args.save_interval次， 就可能会得到更好的参数，
             # 以存下最佳的参数存到***_best.params文件中
             # 同时每循环args.save_interval次， 也会将此时的参数存到另一个文件中
+
 
 if __name__ == '__main__':
     args = parse_args()
