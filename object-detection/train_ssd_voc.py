@@ -250,9 +250,12 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
              """
             with autograd.record():
                 cls_preds, box_preds, _ = net(data)
+                # cls_preds: (batch_size, num_anchors, num_cls + 1)
                 sum_loss, cls_loss, box_loss = mbox_loss(
                     cls_preds, box_preds, cls_targets, box_targets)
                 # 计算loss的时候，是Compute loss in entire batch across devices.
+                # 也就是： divide by the sum of num positive targets in batch
+                # sum_loss, cls_loss, box_loss 的形状???
                 if args.amp:
                     with amp.scale_loss(sum_loss, trainer) as scaled_loss:
                         scaled_loss.backward()
@@ -260,14 +263,14 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
                     sum_loss.backward()
             trainer.step(1)
             # since we have already normalized the loss, we don't want to normalize
-            # by batch-size anymore???  哪里normalize loss了？
-            # 是计算loss的时候已经除以了batch_size??
+            # by batch-size anymore
 
             if (not args.horovod or hvd.rank() == 0):
                 local_batch_size = int(args.batch_size // (hvd.size() if args.horovod else 1))
                 ce_metric.update(0, [l * local_batch_size for l in cls_loss])
                 smoothl1_metric.update(0, [l * local_batch_size for l in box_loss])
                 # ce_metric 和 smoothl1_metric 为什么要乘以local_batch_size...T_T
+                # to get loss per image
 
                 if args.log_interval and not (i + 1) % args.log_interval:
                     # 每隔args.log_interval就记录一次
