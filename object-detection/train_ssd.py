@@ -186,7 +186,7 @@ def validate(net, val_data, ctx, eval_metric):
             gt_bboxes.append(y.slice_axis(axis=-1, begin=0, end=4))
             gt_difficults.append(y.slice_axis(axis=-1, begin=5, end=6) if y.shape[-1] > 5 else None)
         eval_metric.update(det_bboxes, det_ids, det_scores, gt_bboxes, gt_ids, gt_difficults)
-        return eval_metric.get()
+    return eval_metric.get()
         # eval_metric， 返回的values(Value of the evaluation)是每一个类的ap值和map,
         # 其中最后一个是mAP值: 也就是所有类的ap值的总和除以类别数
 
