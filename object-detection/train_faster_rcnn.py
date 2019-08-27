@@ -17,7 +17,7 @@ from gluoncv.data.transforms.presets.rcnn import FasterRCNNDefaultTrainTransform
 from gluoncv.utils.metrics.voc_detection import VOC07MApMetric
 from gluoncv.utils.metrics.coco_detection import COCODetectionMetric
 
-# 下面这两个是需要自己实现吗？？？
+# 下面这报错部分是需要自己实现吗？？？pakage里面没有找到这些方法
 from gluoncv.utils.parallel import Parallelizable, Parallel
 from gluoncv.utils.metrics.rcnn import RPNAccMetric, RPNL1LossMetric, RCNNAccMetric, \
     RCNNL1LossMetric
@@ -150,10 +150,11 @@ def get_dataset(args):
 def get_loader(net, train_dataset, val_dataset, batch_size, args):
     train_transform = FasterRCNNDefaultTrainTransform(net.short, net.max_size, net,
                                                       ashape=net.ashape, multi_stage=args.use_fpn)
-    # return images, labels, rpn_cls_targets, rpn_box_targets, rpn_box_masks
     train_batchify_fn = batchify.Tuple(*[batchify.Append() for _ in range(5)])
     train_loader = mx.gluon.data.DataLoader(train_dataset.transform(train_transform),
         batch_size, shuffle=True, batchify_fn=train_batchify_fn, last_batch='rollover')
+    # train_loader中每个batch中的每个data如下
+    # data, label, rpn_cls_targets, rpn_box_targets, rpn_box_masks
 
     short = net.short[-1] if isinstance(net.short, (tuple, list)) else net.short
     val_transform = FasterRCNNDefaultValTransform(short, net.max_size)
@@ -199,8 +200,8 @@ def validate(net, val_data, ctx, eval_metric, args):
         det_bboxes, det_ids, det_scores = [], [], []
         gt_bboxes, gt_ids, gt_difficults = [], [], []
         for x, y, im_scale in zip(*batch):
+            # im_scale: 是什么。。？
             ids, scores, bboxes = net(x)
-
             det_ids.append(ids)
             det_scores.append(scores)
             det_bboxes.append(clipper(bboxes, x))
@@ -367,6 +368,7 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
         rcnn_task = ForwardBackwardTask(net, trainer, rpn_cls_loss, rpn_box_loss,
                                         rcnn_cls_loss, rcnn_box_loss, mix_ratio=1.0)
         executor = Parallel(1 if args.horovod else args.executor_threads, rcnn_task)
+        # executor 这一句什么意思
 
         if args.mixup:
             train_data._dataset._data.set_mixup(np.random.uniform, 0.5, 0.5)
@@ -391,15 +393,15 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
 
         for i, batch in enumerate(train_data):
             if epoch == 0 and i <= lr_warmup:
-                ner_lr = base_lr * get_lr_at_iter(i / lr_warmup)
-                if ner_lr != trainer.learning_rate:
+                new_lr = base_lr * get_lr_at_iter(i / lr_warmup)
+                if new_lr != trainer.learning_rate:
                     if i % args.log_interval == 0:
                         logger.info('[Epoch 0 Iteration {}] Set learning rate to {}'.format(i, new_lr))
                     trainer.set_learning_rate(new_lr)
             batch = split_and_load(batch, ctx_list=ctx)
             batch_size = len(batch[0])
-            metric_losses = [[] for _ in metrics]
-            add_losses = [[] for _ in metrics2]
+            metric_losses = [[] for _ in metrics]  # metric: rpn_cls_loss, rpn_box_loss, rcnn_cls_loss, rcnn_box_loss
+            add_losses = [[] for _ in metrics2]  # metrics2 = [rpn_acc_metric, rpn_bbox_metric, rcnn_acc_metric, rcnn_bbox_metric]
 
             for data in zip(*batch):
                 executor.put(data)
