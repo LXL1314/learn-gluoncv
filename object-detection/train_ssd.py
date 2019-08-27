@@ -289,7 +289,7 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
                         epoch, i, args.batch_size / (time.time() - btic), name1, loss1, name2, loss2))
                 btic = time.time()
 
-        if (not args.horovod or hvd.rank() == 0):
+        if (not args.horovod) or hvd.rank() == 0:
             name1, loss1 = ce_metric.get()
             name2, loss2 = smoothl1_metric.get()
             logger.info('[Epoch {}] Training cost: {:.3f}, {}={:.3f}, {}={:.3f}'.format(

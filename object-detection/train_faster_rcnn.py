@@ -27,6 +27,7 @@ try:
 except ImportError:
     hvd = None
 
+# mixup 是一种数据增广方式
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Faster-RCNN networks end to end")
     parser.add_argument("--network", type='str', default="resnet50_v1b",
@@ -224,11 +225,264 @@ def get_lr_at_iter(alpha): # 这个函数什么作用
 
 
 class ForwardBackwardTask(Parallelizable):
-    def __init__(self, ):
+    def __init__(self, net, optimizer, rpn_cls_loss, rpn_box_loss,
+                 rcnn_cls_loss, rcnn_box_loss, mix_ratio):
         super(ForwardBackwardTask, self).__init__()
+        self.net = net
+        self.optimizer = optimizer
+        self.rpn_cls_loss = rpn_cls_loss
+        self.rpn_box_loss = rpn_box_loss
+        self.rcnn_cls_loss = rcnn_cls_loss
+        self.rcnn_box_loss = rcnn_box_loss
+        self.mix_ratio = mix_ratio
+
+    def forward(self, x):
+        data, label, rpn_cls_targets, rpn_box_targets, rpn_box_masks = x
+        """
+        data:  (1, 3, h, w)
+        label: (1, num_obj, 6)
+        rpn_cls_targets:  (1, num_anchors)
+        rpn_box_targets:  (1, num_anchors, 4)
+        rpn_box_masks  :  (1, num_anchors, 4)
+        """
+        with autograd.record():
+            gt_box = label[:, :, :4]
+            gt_label = label[:, :, 4:5]
+            cls_preds, box_preds, roi, samples, matches, rpn_score, rpn_box, anchors = self.net(data, gt_box)
+            """
+            cls_preds: (1, 128, num_cls + 1)
+            box_preds: (1, 128, num_cls, 4)
+            roi: (1, 128, 4)
+            samples: (1, 128)
+            matches: (1, 128)
+            rpn_score: (1, num_anchors, 1)  rpn_cls_targets:  (1, num_anchors)
+            rpn_box: (1, num_anchors, 4)    rpn_box_targets:  (1, num_anchors, 4)
+            anchors: (1, num_anchors, 4)    rpn_box_masks  :  (1, num_anchors, 4)
+            """
+
+            # loss of rpn
+            rpn_score = rpn_score.squeeze(axis=-1)
+            num_rpn_pos = (rpn_cls_targets >= 0).sum()
+            rpn_loss_cls = self.rpn_cls_loss(rpn_score, rpn_cls_targets, rpn_cls_targets >= 0) * \
+                           rpn_cls_targets.size / num_rpn_pos
+            rpn_loss_box = self.rpn_box_loss(rpn_box, rpn_box_targets, rpn_box_masks) * \
+                           rpn_box_targets.size / num_rpn_pos
+            rpn_loss = rpn_loss_cls + rpn_loss_box
+
+            # loss of rcnn
+            cls_targets, box_targets, box_masks = self.net.target_generator(roi, samples,
+                                                                            matches, gt_label, gt_box)
+            """
+            cls_targets:  (1, 128)                cls_preds: (1, 128, num_cls + 1)
+            box_targets:  (1, 128, num_cls, 4)    box_preds: (1, 128, num_cls, 4)
+            box_masks  :  (1, 128, num_cls, 4)
+            """
+            num_rcnn_pos = (cls_targets >= 0).sum()
+            rcnn_loss_cls = self.rcnn_cls_loss(cls_preds, cls_targets, cls_targets >= 0) * \
+                            cls_targets.size / cls_targets.shape[0] / num_rcnn_pos
+            rcnn_loss_box = self.rcnn_box_loss(box_preds, box_targets, box_masks) * \
+                            box_targets.size / box_targets.shape[0] / num_rcnn_pos
+            rcnn_loss = rcnn_loss_cls + rcnn_loss_box
+
+            # overall loss
+            total_loss = rpn_loss.sum() * self.mix_ratio + rcnn_loss.sum() * self.mix_ratio
+
+            rpn_cls_loss_metric = rpn_loss_cls.sum() * self.mix_ratio
+            rpn_box_loss_metric = rpn_loss_box.sum() * self.mix_ratio
+            rcnn_cls_loss_metric = rcnn_loss_cls.sum() * self.mix_ratio
+            rcnn_box_loss_metric = rcnn_loss_box.sum() * self.mix_ratio
+            rpn_acc_metric = [[rpn_cls_targets, rpn_cls_targets >= 0], [rpn_score]]
+            rpn_l1_loss_metric = [[rpn_box_targets, rpn_box_masks], [rpn_box]]
+            rcnn_acc_metric = [[cls_targets], [cls_preds]]
+            rcnn_l1_loss_metric = [[box_targets, box_masks], [box_preds]]
+
+        if args.amp:
+            with amp.scale_loss(total_loss, self.optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            total_loss.backward()
+
+        return rpn_cls_loss_metric, rpn_box_loss_metric, rcnn_cls_loss_metric, rcnn_box_loss_metric, \
+               rpn_acc_metric, rpn_l1_loss_metric, rcnn_acc_metric, rcnn_l1_loss_metric
 
 
+def train(net, train_data, val_data, eval_metric, ctx, args):
+    net.collect_params.reset_ctx(ctx)
+    kv = mx.kvstore.create(args.kv_store)
+    net.collect_params().setattr('grad_req', 'null')
+    net.collect_train_params.setattr('grad_req', 'write')
+    if args.horovod:
+        hvd.broadcast_parameters(net.collect_params(), root_rank=0)
+        trainer = hvd.DistributedTrainer(net.collect_train_params(), 'sgd',
+                                         {'learning_rate': args.lr, 'wd': args.wd, 'momentum': args.momentum})
+    else:
+        trainer = gluon.Trainer(net.collect_train_params(), 'sgd',
+                                {'learning_rate': args.lr, 'wd': args.wd, 'momentum': args.momentum},
+                                update_on_kvstore=(False if args.amp else None), kvstore=kv)
+    if args.amp:
+        amp.init_trainer(trainer)
+
+    lr_decay = float(args.lr_decay)
+    lr_steps = sorted([float(ls) for ls in args.lr_decay_epoch.split(',') if ls.strip()])
+    lr_warmup = float(args.lr_warmup)
+
+    # losses, 以下4个loss是rcnn_task 里面要用到
+    rpn_cls_loss = mx.gluon.loss.SigmoidBinaryCrossEntropyLoss(from_sigmoid=False)
+    rpn_box_loss = mx.gluon.loss.HuberLoss(rho=1 / 9.)
+    rcnn_cls_loss = mx.gluon.loss.SoftmaxCrossEntropyLoss()
+    rcnn_box_loss = mx.gluon.loss.HuberLoss()
+
+    metrics = [mx.metric.Loss('RPN_Conf'),
+               mx.metric.Loss('RPN_SmoothL1'),
+               mx.metric.Loss('RCNN_CrossEntropy'),
+               mx.metric.Loss('RCNN_SmoothL1')]
+
+    rpn_acc_metric = RPNAccMetric()
+    rpn_bbox_metric = RPNL1LossMetric()
+    rcnn_acc_metric = RCNNAccMetric()
+    rcnn_bbox_metric = RCNNL1LossMetric()
+    metrics2 = [rpn_acc_metric, rpn_bbox_metric, rcnn_acc_metric, rcnn_bbox_metric]
+
+    # logger set_up
+    logging.basicConfig()
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    log_file_path = args.save_prefix + '_train.log'
+    log_dir = os.path.dirname(log_file_path)
+    if log_dir and not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+    fh = logging.FileHandler(log_file_path)
+    logger.addHandler(fh)
+    logger.info(args)
+    if args.verbose:
+        logger.info('Trainable parameters:')
+        logger.info(net.collect_train_params().keys())
+    logger.info("Start training from [Epoch {}]".format(args.start_epoch))
+    best_map = [0]
+
+    for epoch in range(args.start_epoch, args.epochs):
+        mix_ratio = 1.0
+        if not args.disable_hybridization:
+            net.hybridize(static_alloc=args.static_alloc)
+        rcnn_task = ForwardBackwardTask(net, trainer, rpn_cls_loss, rpn_box_loss,
+                                        rcnn_cls_loss, rcnn_box_loss, mix_ratio=1.0)
+        executor = Parallel(1 if args.horovod else args.executor_threads, rcnn_task)
+
+        if args.mixup:
+            train_data._dataset._data.set_mixup(np.random.uniform, 0.5, 0.5)
+            mix_ratio =0.5
+            if epoch >= args.epochs - args.no_mixup_epochs:
+                train_data._dataset._data.set_mixup(None)
+                mix_ratio = 1.0
+
+        while lr_steps and epoch >= lr_steps[0]:
+            new_lr = trainer.learning_rate * lr_decay
+            lr_steps.pop(0)
+            trainer.set_learning_rate(new_lr)
+            logger.info('[Epoch {}] Set learning rate to {}'.format(epoch, new_lr))
+
+        for metric in metrics:
+            metric.reset()
+
+        tic = time.time()  # 记录一次循环的时间
+        btic = time.time()  # 记录每一个batch的时间
+        base_lr = trainer.learning_rate
+        rcnn_task.mix_ratio = mix_ratio
+
+        for i, batch in enumerate(train_data):
+            if epoch == 0 and i <= lr_warmup:
+                ner_lr = base_lr * get_lr_at_iter(i / lr_warmup)
+                if ner_lr != trainer.learning_rate:
+                    if i % args.log_interval == 0:
+                        logger.info('[Epoch 0 Iteration {}] Set learning rate to {}'.format(i, new_lr))
+                    trainer.set_learning_rate(new_lr)
+            batch = split_and_load(batch, ctx_list=ctx)
+            batch_size = len(batch[0])
+            metric_losses = [[] for _ in metrics]
+            add_losses = [[] for _ in metrics2]
+
+            for data in zip(*batch):
+                executor.put(data)
+
+            for j in range(len(ctx)):
+                result = executor.get()
+                if (not args.horovod) or hvd.rank() == 0:
+                    for k in range(len(metric_losses)):
+                        metric_losses[k].append(result[k])
+                    for k in range(len(add_losses)):
+                        add_losses[k].append(result[len(metric_losses) + k])
+
+            for metric, record in zip(metrics, metric_losses):
+                metric.update(0, record)
+            for metric, records in zip(metrics2, add_losses):
+                for pred in records:
+                    metric.update(pred[0], pred[1])
+            trainer.step(batch_size)
+
+            if (not args.horovod or hvd.rank() == 0) and args.log_interval and not (i + 1) % args.log_interval:
+                msg = ','.join(['{} ={:.3f}'.format(*metric.get()) for metric in metrics + metrics2])
+                logger.info('[Epoch {}][Batch {}], Speed: {:.3f} samples/sec, {}'.format(
+                    epoch, i, args.batch_size * args.log_interval / (time.time() - btic), msg))
+                btic = time.time()
+
+        if (not args.horovod) or hvd.rank() == 0:
+            msg = ','.join(['{} ={:.3f}'.format(*metric.get()) for metric in metrics])
+            logger.info('[Epoch {}] Training cost: {:.3f}, {}'.format(
+                epoch, (time.time() - tic), msg))
+            if (epoch % args.val_interval == 0) or (args.save_interval and epoch % args.save_interval == 0):
+                # 每循环args.val_interval或者args.save_interval次
+                # 就需要使用验证集来测试一次，得到current_map
+                map_name, mean_ap = validate(net, val_data, ctx, eval_metric, args)
+                val_msg = "\n".join('{}={}'.format(k, v) for k, v in zip(map_name, mean_ap))
+                logger.info('[Epoch {}] Validation: \n{}'.format(epoch, val_msg))
+                current_map = float(mean_ap[-1])  # mean_ap的最后一个数据就是mAP
+            else:
+                current_map = 0
+            save_params(net, logger, best_map, current_map, epoch, args.save_interval, args.save_prefix)
+        executor.__del__()
 
 
+if __name__ == '__main__':
+    import sys
+    sys.setrecursionlimit(1100)
+    args = parse_args()
 
+    if args.amp:
+        amp.init()
 
+    # ctx
+    if args.horovod:
+        ctx = [mx.gpu(hvd.local_rank())]
+        args.batch_size = hvd.size()
+    else:
+        ctx = [mx.gpu(int(i)) for i in args.gpus.split(',') if i.strip()]
+        ctx = ctx if ctx else [mx.cpu()]
+        args.batch_size = len(ctx)
+
+    # network
+    kwargs = {}
+    module_list = []
+    if args.use_fpn:
+        module_list.append('fpn')
+    if args.norm_layer is None:
+        module_list.append(args.norm_layer)
+        if args.norm_layer == 'bn':
+            kwargs['num_devices'] = len(args.gpus.split(','))
+    net_name = '_'.join(('faster_rcnn', *module_list, args.network, args.dataset))
+    args.save_prefix += net_name
+    net = get_model(net_name, pretrained=True, **kwargs)
+    if args.resume.strip():
+        net.load_parameters(args.resume.strip())
+    else:
+        for param in net.collect_params().values():
+            if param._data is not None:
+                continue
+            param.initialize()
+
+    # get data
+    train_dataset, val_dataset, eval_metric = get_dataset(args.dataset, args)
+    batch_size = 1 if args.horovod else args.batch_size
+    train_data, val_data = get_loader(net, train_dataset, val_dataset, batch_size, args)
+
+    # training
+    train(net, train_data, val_data, eval_metric, ctx, args)
