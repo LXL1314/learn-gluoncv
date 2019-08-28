@@ -7,7 +7,10 @@ im_fname = utils.download('https://github.com/dmlc/web-data/blob/master/' +
                           'gluoncv/detection/street_small.jpg?raw=true',
                           path='../img/street_small.jpg')
 x, img = data.transforms.presets.ssd.load_test(im_fname, short=512)
+# x: (1, 3, h, w)
+# img: (h, w, 3)
 
 class_IDs, scores, bounding_boxes = net(x)
+
 ax = utils.viz.plot_bbox(img, bounding_boxes[0], scores[0], class_IDs[0], thresh=0.9, class_names=net.classes)
 plt.show()
