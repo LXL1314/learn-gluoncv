@@ -23,7 +23,7 @@ from gluoncv.utils.metrics.coco_detection import COCODetectionMetric
 
 ### 没有弄懂下面两个 工具到底是干什么的
 from mxnet.contrib import amp
-import horovod.mxnet as hvd  # horovod安装失败了，但是在服务器上安装成功了
+import horovod.mxnet as hvd  # 在github下载了，把包copy到了python/lib/site-pakage下面
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train SSD on Pascal VOC dataset")
