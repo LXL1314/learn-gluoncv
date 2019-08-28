@@ -10,14 +10,12 @@ from mxnet import gluon, autograd
 from mxnet.contrib import amp
 import gluoncv as gcv
 from gluoncv import data as gdata
-from gluoncv import utils as gutils
 from gluoncv.model_zoo import get_model
 from gluoncv.data import batchify
 from gluoncv.data.transforms.presets.rcnn import FasterRCNNDefaultTrainTransform, FasterRCNNDefaultValTransform
 from gluoncv.utils.metrics.voc_detection import VOC07MApMetric
 from gluoncv.utils.metrics.coco_detection import COCODetectionMetric
 
-# 下面这报错部分是需要自己实现吗？？？pakage里面没有找到这些方法
 from gluoncv.utils.parallel import Parallelizable, Parallel
 from gluoncv.utils.metrics.rcnn import RPNAccMetric, RPNL1LossMetric, RCNNAccMetric, \
     RCNNL1LossMetric
@@ -150,18 +148,51 @@ def get_dataset(args):
 def get_loader(net, train_dataset, val_dataset, batch_size, args):
     train_transform = FasterRCNNDefaultTrainTransform(net.short, net.max_size, net,
                                                       ashape=net.ashape, multi_stage=args.use_fpn)
+    # return images, labels, rpn_cls_targets, rpn_box_targets, rpn_box_masks
     train_batchify_fn = batchify.Tuple(*[batchify.Append() for _ in range(5)])
     train_loader = mx.gluon.data.DataLoader(train_dataset.transform(train_transform),
         batch_size, shuffle=True, batchify_fn=train_batchify_fn, last_batch='rollover')
-    # train_loader中每个batch中的每个data如下
-    # data, label, rpn_cls_targets, rpn_box_targets, rpn_box_masks
 
     short = net.short[-1] if isinstance(net.short, (tuple, list)) else net.short
     val_transform = FasterRCNNDefaultValTransform(short, net.max_size)
-    # return to what? why 3？
+    # return to x, y, im_scale
     val_batchify_fn = batchify.Tuple(*[batchify.Append() for _ in range(3)])
     val_loader = mx.gluon.data.DataLoader(val_dataset.transform(val_transform), batch_size, shuffle=False,
                             batchify_fn=val_batchify_fn, last_batch='keep')
+    """
+    train_loader：
+    每个batch为（[data1, data2,...], [label, label2,...], [rpn_cls_targets1, rpn_cls_targets2, ...],
+    [rpn_box_targets1, rpn_box_targets2, ...], [rpn_box_masks1, rpn_box_masks2, ...]）
+    
+    for data, label, rpn_cls_targets, rpn_box_targets, rpn_box_masks in zip(*train_loader):
+        rpn_cls_targets: (1, N)   rpn_box_targets: (1, N, 4)   rpn_box_masks: (1, N, 4)
+    
+    val_loader:
+    每个batch为（[data1, data2,...], [label, label2,...], [im_scale1, im_scale2, ...]）
+    for data, label, im_scale in zip(*val_loader):
+        im_scale: (1, 1) 
+        但是还没搞清楚im_scale是什么东西 T_T
+    
+    cls_preds, box_preds, roi, samples, matches, rpn_score, rpn_box, anchors = net(data, gt_box)
+    cls_targets, box_targets, box_masks = net.target_generator(roi, samples, matches, gt_label, gt_box)
+            
+    data:  (1, 3, h, w)
+    label: (1, num_obj, 6)
+            
+    # rpn
+    roi: (1, 128, 4)
+    samples: (1, 128)
+    matches: (1, 128)
+            
+    rpn_cls_targets: (1, N)                  rpn_score:  (1, N, 1)
+    rpn_box_targets: (1, N, 4)               rpn_box:  (1, N, 4)
+    rpn_box_masks:   (1, N, 4)
+    
+    # rcnn
+    cls_targets:   (1, 128)                   cls_preds: (1, 128, num_cls + 1)
+    box_targets:   (1, 128, num_cls, 4)       box_preds: (1, 128, num_cls, 4)
+    rcnn box mask: (1, 128, num_cls, 4)
+    """
     return train_loader, val_loader
 
 
@@ -181,10 +212,14 @@ def save_params(net, logger, best_map, current_map, epoch, save_interval, prefix
 
 
 def split_and_load(batch, ctx_list):
-    """split data to 1 batch each device 什么意思？_？"""
+    """split data to 1 batch each device , 也就是让每个device上有一个图片数据"""
     new_batch = []
     for i, data in enumerate(batch):
         new_data = [x.as_in_context(ctx) for x, ctx in zip(data, ctx_list)]
+        # val_loader中每个batch为（[data1, data2,...], [label1, label2,...], [im_scale1, im_scale2, ...]）
+        # 若ctx_list长度 和 data 长度的最小值为n
+        # 则 new_batch = [[data1, ..., data_n], [label1, ..., label_n], [im_scale1, ..., im_scale_n]]
+        # 且每个device上有一个图片数据，即例如: data1, label1, im_scale1都在device0上面
         new_batch.append(new_data)
     return new_batch
 
@@ -200,8 +235,10 @@ def validate(net, val_data, ctx, eval_metric, args):
         det_bboxes, det_ids, det_scores = [], [], []
         gt_bboxes, gt_ids, gt_difficults = [], [], []
         for x, y, im_scale in zip(*batch):
-            # im_scale: 是什么。。？
             ids, scores, bboxes = net(x)
+            # ids:  (1, num_box, 1)
+            # scores:  (1, num_box, 1)
+            # bboxes:  (1, num_box, 4)
             det_ids.append(ids)
             det_scores.append(scores)
             det_bboxes.append(clipper(bboxes, x))
@@ -214,10 +251,6 @@ def validate(net, val_data, ctx, eval_metric, args):
             gt_difficults.append(y.slice_axis(axis=-1, begin=5, end=6) if y.shape[-1] > 5 else None)
 
         eval_metric.update(det_bboxes, det_ids, det_scores, gt_bboxes, gt_ids, gt_difficults)
-        """
-    for det_bbox, det_id, det_score, gt_bbox, gt_id, gt_diff in zip(det_bboxes, det_ids, det_scores, gt_bboxes, gt_ids, gt_difficults):
-        eval_metric.update(det_bbox, det_id, det_score, gt_bbox, gt_id, gt_diff)
-        """
     return eval_metric.get()
 
 
@@ -239,26 +272,29 @@ class ForwardBackwardTask(Parallelizable):
 
     def forward(self, x):
         data, label, rpn_cls_targets, rpn_box_targets, rpn_box_masks = x
-        """
-        data:  (1, 3, h, w)
-        label: (1, num_obj, 6)
-        rpn_cls_targets:  (1, num_anchors)
-        rpn_box_targets:  (1, num_anchors, 4)
-        rpn_box_masks  :  (1, num_anchors, 4)
-        """
         with autograd.record():
             gt_box = label[:, :, :4]
             gt_label = label[:, :, 4:5]
             cls_preds, box_preds, roi, samples, matches, rpn_score, rpn_box, anchors = self.net(data, gt_box)
+            cls_targets, box_targets, box_masks = self.net.target_generator(roi, samples,
+                                                                            matches, gt_label, gt_box)
             """
-            cls_preds: (1, 128, num_cls + 1)
-            box_preds: (1, 128, num_cls, 4)
+            data:  (1, 3, h, w)
+            label: (1, num_obj, 6)
+            
+            # rpn
             roi: (1, 128, 4)
             samples: (1, 128)
             matches: (1, 128)
-            rpn_score: (1, num_anchors, 1)  rpn_cls_targets:  (1, num_anchors)
-            rpn_box: (1, num_anchors, 4)    rpn_box_targets:  (1, num_anchors, 4)
-            anchors: (1, num_anchors, 4)    rpn_box_masks  :  (1, num_anchors, 4)
+            
+            rpn_cls_targets: (1, N)                  rpn_score:  (1, N, 1)
+            rpn_box_targets: (1, N, 4)               rpn_box:  (1, N, 4)
+            rpn_box_masks:   (1, N, 4)
+    
+            # rcnn
+            cls_targets:   (1, 128)                   cls_preds: (1, 128, num_cls + 1)
+            box_targets:   (1, 128, num_cls, 4)       box_preds: (1, 128, num_cls, 4)
+            rcnn box mask: (1, 128, num_cls, 4)
             """
 
             # loss of rpn
@@ -271,13 +307,6 @@ class ForwardBackwardTask(Parallelizable):
             rpn_loss = rpn_loss_cls + rpn_loss_box
 
             # loss of rcnn
-            cls_targets, box_targets, box_masks = self.net.target_generator(roi, samples,
-                                                                            matches, gt_label, gt_box)
-            """
-            cls_targets:  (1, 128)                cls_preds: (1, 128, num_cls + 1)
-            box_targets:  (1, 128, num_cls, 4)    box_preds: (1, 128, num_cls, 4)
-            box_masks  :  (1, 128, num_cls, 4)
-            """
             num_rcnn_pos = (cls_targets >= 0).sum()
             rcnn_loss_cls = self.rcnn_cls_loss(cls_preds, cls_targets, cls_targets >= 0) * \
                             cls_targets.size / cls_targets.shape[0] / num_rcnn_pos
@@ -292,6 +321,7 @@ class ForwardBackwardTask(Parallelizable):
             rpn_box_loss_metric = rpn_loss_box.sum() * self.mix_ratio
             rcnn_cls_loss_metric = rcnn_loss_cls.sum() * self.mix_ratio
             rcnn_box_loss_metric = rcnn_loss_box.sum() * self.mix_ratio
+
             rpn_acc_metric = [[rpn_cls_targets, rpn_cls_targets >= 0], [rpn_score]]
             rpn_l1_loss_metric = [[rpn_box_targets, rpn_box_masks], [rpn_box]]
             rcnn_acc_metric = [[cls_targets], [cls_preds]]
@@ -337,6 +367,9 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
                mx.metric.Loss('RPN_SmoothL1'),
                mx.metric.Loss('RCNN_CrossEntropy'),
                mx.metric.Loss('RCNN_SmoothL1')]
+    # metrics: [rpn_cls_loss, rpn_box_loss, rcnn_cls_loss, rcnn_box_loss]
+    # metric_losses: [[rpn_cls_loss], [rpn_box_loss], [rcnn_cls_loss], [rcnn_box_loss]]
+    # metric.update(0, record)
 
     rpn_acc_metric = RPNAccMetric()
     rpn_bbox_metric = RPNL1LossMetric()
@@ -365,6 +398,7 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
         mix_ratio = 1.0
         if not args.disable_hybridization:
             net.hybridize(static_alloc=args.static_alloc)
+
         rcnn_task = ForwardBackwardTask(net, trainer, rpn_cls_loss, rpn_box_loss,
                                         rcnn_cls_loss, rcnn_box_loss, mix_ratio=1.0)
         executor = Parallel(1 if args.horovod else args.executor_threads, rcnn_task)
@@ -377,6 +411,7 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
                 train_data._dataset._data.set_mixup(None)
                 mix_ratio = 1.0
 
+        # 调整学习率
         while lr_steps and epoch >= lr_steps[0]:
             new_lr = trainer.learning_rate * lr_decay
             lr_steps.pop(0)
@@ -400,8 +435,8 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
                     trainer.set_learning_rate(new_lr)
             batch = split_and_load(batch, ctx_list=ctx)
             batch_size = len(batch[0])
-            metric_losses = [[] for _ in metrics]  # metric: rpn_cls_loss, rpn_box_loss, rcnn_cls_loss, rcnn_box_loss
-            add_losses = [[] for _ in metrics2]  # metrics2 = [rpn_acc_metric, rpn_bbox_metric, rcnn_acc_metric, rcnn_bbox_metric]
+            metric_losses = [[] for _ in metrics]  # metrics: [rpn_cls_loss, rpn_box_loss, rcnn_cls_loss, rcnn_box_loss]
+            add_losses = [[] for _ in metrics2]  # metrics2 : [rpn_acc_metric, rpn_bbox_metric, rcnn_acc_metric, rcnn_bbox_metric]
 
             for data in zip(*batch):
                 executor.put(data)
@@ -415,9 +450,17 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
                         add_losses[k].append(result[len(metric_losses) + k])
 
             for metric, record in zip(metrics, metric_losses):
+                # metrics: [rpn_cls_loss, rpn_box_loss, rcnn_cls_loss, rcnn_box_loss]
+                # metric_losses: [[rpn_cls_loss], [rpn_box_loss], [rcnn_cls_loss], [rcnn_box_loss]]
                 metric.update(0, record)
             for metric, records in zip(metrics2, add_losses):
+            # metrics2 = [rpn_acc_metric, rpn_bbox_metric, rcnn_acc_metric, rcnn_bbox_metric]
+            # add_losses: [[rpn_acc_metric], [rpn_bbox_metric], [rcnn_acc_metric], [rcnn_bbox_metric]]
+            # rpn_acc_metric: [[rpn_label, rpn_weight], [rpn_cls_logits]]
                 for pred in records:
+                    # update(label, preds)
+                    # label: [rpn_label, rpn_weight]
+                    # preds: [rpn_cls_logits]
                     metric.update(pred[0], pred[1])
             trainer.step(batch_size)
 
