@@ -114,7 +114,7 @@ def get_dataloader(net, train_dataset, val_dataset, data_shape, batch_size, num_
     width, height = data_shape, data_shape
     # use fake data to generate fixed anchors for target generation
     with autograd.train_mode():
-        _, _, anchors = net(mx.nd.array((1, 3, height, width), ctx))
+        _, _, anchors = net(mx.nd.zeros((1, 3, height, width), ctx))
         # anchors: (1, N, 4): N 为 图片中anchors的数量
     anchors = anchors.as_in_context(mx.cpu())
     batchify_fn = Tuple(Stack(), Stack(), Stack())  # stack image, cls_targets, box_targets
@@ -275,6 +275,8 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
                 smoothl1_metric.update(0, [l * local_batch_size for l in box_loss])
                 # ce_metric 和 smoothl1_metric 为什么要乘以local_batch_size...T_T
                 # to get loss per image
+                # ce_metric.get()，smoothl1_metric.get() 方法里面会除以batch_size
+                # 所以在这之前，要先乘以batch_size, 否则就会变成loss/num_anchors/(batch_size * batch_size)
 
                 if args.log_interval and not (i + 1) % args.log_interval:
                     # 每隔args.log_interval就记录一次

@@ -13,4 +13,5 @@ x, img = data.transforms.presets.ssd.load_test(im_fname, short=512)
 class_IDs, scores, bounding_boxes = net(x)
 
 ax = utils.viz.plot_bbox(img, bounding_boxes[0], scores[0], class_IDs[0], thresh=0.9, class_names=net.classes)
+print(net.classes)
 plt.show()
