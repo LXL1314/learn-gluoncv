@@ -4,9 +4,7 @@ import os
 import logging
 import warnings
 import time
-import numpy as np
 import mxnet as mx
-from mxnet import nd
 from mxnet import gluon
 from mxnet import autograd
 import gluoncv as gcv
@@ -16,12 +14,10 @@ from gluoncv.model_zoo import get_model
 from gluoncv.data.batchify import Tuple, Stack, Pad
 from gluoncv.data.transforms.presets.ssd import SSDDefaultTrainTransform
 from gluoncv.data.transforms.presets.ssd import SSDDefaultValTransform
-# from gluoncv.data.transforms.presets.ssd import SSDDALIPipeline
 
 from gluoncv.utils.metrics.voc_detection import VOC07MApMetric
 from gluoncv.utils.metrics.coco_detection import COCODetectionMetric
 
-### 没有弄懂下面两个 工具到底是干什么的
 from mxnet.contrib import amp
 import horovod.mxnet as hvd  # 在github下载了，把包copy到了python/lib/site-pakage下面
 
@@ -348,10 +344,6 @@ if __name__ == '__main__':
             net.initialize()
             async_net.initialize()
             # needed for net to be first gpu when using AMP
-            net.collect_params.reset_ctx(ctx[0])
-            # 还是不太明白为什么只用ctx[0]
-            # 而且在train()中的第一行又有: net.collect_params().reset_ctx(ctx)
-            # 那么net.collect_params.reset_ctx(ctx[0])到底起了什么作用
 
     train_dataset, val_dataset, eval_metric = get_dataset(args.dataset, args)
     batch_size = (args.batch_size // hvd.size()) if args.horovod else args.batch_size
